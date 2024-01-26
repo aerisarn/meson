@@ -613,7 +613,8 @@ class Vs2010Backend(backends.Backend):
                              guid,
                              conftype='Utility',
                              target_ext=None,
-                             target_platform=None) -> T.Tuple[ET.Element, ET.Element]:
+                             target_platform=None,
+                             target_uwp) -> T.Tuple[ET.Element, ET.Element]:
         root = ET.Element('Project', {'DefaultTargets': "Build",
                                       'ToolsVersion': '4.0',
                                       'xmlns': 'http://schemas.microsoft.com/developer/msbuild/2003'})
@@ -661,7 +662,8 @@ class Vs2010Backend(backends.Backend):
 
             p = ET.SubElement(globalgroup, 'Platform')
             p.text = target_platform
-            if conftype == 'DynamicLibrary' and self.environment.coredata.get_option(OptionKey('uwp')):
+            #if conftype == 'DynamicLibrary' and self.environment.coredata.get_option(OptionKey('uwp')):
+            if target_uwp:
                 ET.SubElement(globalgroup, 'AppContainerApplication').text = 'true'
                 ET.SubElement(globalgroup, 'ApplicationType').text = 'Windows Store'
                 ET.SubElement(globalgroup, 'WindowsTargetPlatformVersion').text = self.windows_target_platform_version
@@ -697,7 +699,7 @@ class Vs2010Backend(backends.Backend):
     def gen_run_target_vcxproj(self, target: build.RunTarget, ofname: str, guid: str) -> None:
         (root, type_config) = self.create_basic_project(target.name,
                                                         temp_dir=target.get_id(),
-                                                        guid=guid)
+                                                        guid=guid, target_uwp=False)
         depend_files = self.get_target_depend_files(target)
 
         if not target.command:
@@ -732,7 +734,7 @@ class Vs2010Backend(backends.Backend):
         (root, type_config) = self.create_basic_project(target.name,
                                                         temp_dir=target.get_id(),
                                                         guid=guid,
-                                                        target_platform=platform)
+                                                        target_platform=platform, target_uwp=False)
         # We need to always use absolute paths because our invocation is always
         # from the target dir, not the build root.
         target.absolute_paths = True
@@ -772,7 +774,7 @@ class Vs2010Backend(backends.Backend):
         (root, type_config) = self.create_basic_project(target.name,
                                                         temp_dir=target.get_id(),
                                                         guid=guid,
-                                                        target_platform=platform)
+                                                        target_platform=platform, target_uwp=False)
         ET.SubElement(root, 'Import', Project=r'$(VCTargetsPath)\Microsoft.Cpp.targets')
         target.generated = [self.compile_target_to_generator(target)]
         target.sources = []
@@ -837,6 +839,15 @@ class Vs2010Backend(backends.Backend):
             return True
         return entry[1:].startswith('M')
 
+    def is_uwp(self, file_args) -> bool:
+        #file_args: T.Dict[str, CompilerArgs] = {l: c.compiler_args() for l, c in target.compilers.items()}
+        args = []
+        if 'cpp' in file_args:
+            for arg in file_args['cpp'].to_native():
+                if arg == '/ZW':
+                    return True
+        return False
+
     def add_additional_options(self, lang, parent_node, file_args):
         args = []
         for arg in file_args[lang].to_native():
@@ -844,6 +855,8 @@ class Vs2010Backend(backends.Backend):
                 continue
             if arg == '%(AdditionalOptions)':
                 args.append(arg)
+            elif arg == '/ZW':
+                ET.SubElement(parent_node, 'CompileAsWinRT').text = 'true'
             else:
                 args.append(self.escape_additional_option(arg))
         ET.SubElement(parent_node, "AdditionalOptions").text = ' '.join(args)
@@ -970,6 +983,56 @@ class Vs2010Backend(backends.Backend):
         with open(ofname_tmp, 'w', encoding='utf-8') as of:
             of.write(doc.toprettyxml())
         replace_if_different(ofname, ofname_tmp)
+        
+    # Returns:  (target_args,file_args), (target_defines,file_defines), (target_inc_dirs,file_inc_dirs)
+    def get_args(self, target, compiler, build_args):
+        # Arguments, include dirs, defines for all files in the current target
+        target_args = []
+        target_defines = []
+        target_inc_dirs = []
+        # Arguments, include dirs, defines passed to individual files in
+        # a target; perhaps because the args are language-specific
+        #
+        # file_args is also later split out into defines and include_dirs in
+        # case someone passed those in there
+        file_args: T.Dict[str, CompilerArgs] = {l: c.compiler_args() for l, c in target.compilers.items()}
+        file_defines = {l: [] for l in target.compilers}
+        file_inc_dirs = {l: [] for l in target.compilers}
+        # The order in which these compile args are added must match
+        # generate_single_compile() and generate_basic_compiler_args()
+        for l, comp in target.compilers.items():
+            if l in file_args:
+                file_args[l] += compilers.get_base_compile_args(
+                    target.get_options(), comp)
+                file_args[l] += comp.get_option_compile_args(
+                    target.get_options())
+
+        # Add compile args added using add_project_arguments()
+        for l, args in self.build.projects_args[target.for_machine].get(target.subproject, {}).items():
+            if l in file_args:
+                file_args[l] += args
+        # Add compile args added using add_global_arguments()
+        # These override per-project arguments
+        for l, args in self.build.global_args[target.for_machine].items():
+            if l in file_args:
+                file_args[l] += args
+        # Compile args added from the env or cross file: CFLAGS/CXXFLAGS, etc. We want these
+        # to override all the defaults, but not the per-target compile args.
+        for l in file_args.keys():
+            file_args[l] += target.get_option(OptionKey('args', machine=target.for_machine, lang=l))
+
+        # Add per-target compile args, f.ex, `c_args : ['/DFOO']`. We set these
+        # near the end since these are supposed to override everything else.
+        for l, args in target.extra_args.items():
+            if l in file_args:
+                file_args[l] += args
+        # The highest priority includes. In order of directory search:
+        # target private dir, target build dir, target source dir
+
+        if '/Gw' in build_args:
+            target_args.append('/Gw')
+
+        return (target_args, file_args)
 
     # Returns:  (target_args,file_args), (target_defines,file_defines), (target_inc_dirs,file_inc_dirs)
     def get_args_defines_and_inc_dirs(self, target, compiler, generated_files_include_dirs, proj_to_src_root, proj_to_src_dir, build_args):
@@ -1271,8 +1334,10 @@ class Vs2010Backend(backends.Backend):
             target_args,
             target_defines,
             target_inc_dirs,
-            file_args
+            file_args,
+            uwp
             ) -> None:
+        additional_links = []
         compiler = self._get_cl_compiler(target)
         buildtype_link_args = compiler.get_optimization_link_args(self.optimization)
 
@@ -1435,6 +1500,16 @@ class Vs2010Backend(backends.Backend):
         extra_link_args += compiler.get_option_link_args(target.get_options())
         (additional_libpaths, additional_links, extra_link_args) = self.split_link_args(extra_link_args.to_native())
 
+        if uwp:
+            if self.debug:
+                additional_links += ['vccorlibd.lib']
+                additional_links += ['msvcrtd.lib']
+                extra_link_args.append('/nodefaultlib:vccorlibd /nodefaultlib:msvcrtd')
+            else:
+                additional_links += ['vccorlib.lib']
+                additional_links += ['msvcrt.lib']
+                extra_link_args.append('/nodefaultlib:vccorlib /nodefaultlib:msvcrt')
+
         # Add more libraries to be linked if needed
         for t in target.get_dependencies():
             if isinstance(t, build.CustomTargetIndex):
@@ -1491,6 +1566,7 @@ class Vs2010Backend(backends.Backend):
         if len(extra_link_args) > 0:
             extra_link_args.append('%(AdditionalOptions)')
             ET.SubElement(link, "AdditionalOptions").text = ' '.join(extra_link_args)
+            
         if len(additional_libpaths) > 0:
             additional_libpaths.insert(0, '%(AdditionalLibraryDirectories)')
             ET.SubElement(link, 'AdditionalLibraryDirectories').text = ';'.join(additional_libpaths)
@@ -1535,7 +1611,7 @@ class Vs2010Backend(backends.Backend):
         # /release
         if not target.get_option(OptionKey('debug')):
             ET.SubElement(link, 'SetChecksum').text = 'true'
-        if self.environment.coredata.get_option(OptionKey('uwp')):
+        if uwp:
             ET.SubElement(link, 'GenerateWindowsMetadata').text = 'false'
 
     # Visual studio doesn't simply allow the src files of a project to be added with the 'Condition=...' attribute,
@@ -1565,6 +1641,7 @@ class Vs2010Backend(backends.Backend):
     def gen_vcxproj(self, target: build.BuildTarget, ofname: str, guid: str, vslite_ctx: dict = None) -> bool:
         mlog.debug(f'Generating vcxproj {target.name}.')
         subsystem = 'Windows'
+        uwp = False
         self.handled_target_deps[target.get_id()] = []
 
         if self.gen_lite:
@@ -1582,8 +1659,10 @@ class Vs2010Backend(backends.Backend):
             subsystem = target.win_subsystem.split(',')[0]
         elif isinstance(target, build.StaticLibrary):
             conftype = 'StaticLibrary'
+            uwp = self.environment.coredata.get_option(OptionKey('uwp'))
         elif isinstance(target, build.SharedLibrary):
             conftype = 'DynamicLibrary'
+            uwp = self.environment.coredata.get_option(OptionKey('uwp'))
         elif isinstance(target, build.CustomTarget):
             self.gen_custom_target_vcxproj(target, ofname, guid)
             return True
@@ -1605,13 +1684,19 @@ class Vs2010Backend(backends.Backend):
             platform = self.platform
 
         tfilename = os.path.splitext(target.get_filename())
+        compiler = self._get_cl_compiler(target)
+        build_args = Vs2010Backend.get_build_args(compiler, self.optimization, self.debug, self.sanitize)
+        (c_target_args, c_file_args) = self.get_args(target, compiler, build_args)
+        if self.is_uwp(c_file_args):
+            uwp = self.environment.coredata.get_option(OptionKey('uwp'))
 
         (root, type_config) = self.create_basic_project(tfilename[0],
                                                         temp_dir=target.get_id(),
                                                         guid=guid,
                                                         conftype=conftype,
                                                         target_ext=tfilename[1],
-                                                        target_platform=platform)
+                                                        target_platform=platform,
+                                                        target_uwp=uwp)
 
         generated_files, custom_target_output_files, generated_files_include_dirs = self.generate_custom_generator_commands(
             target, root)
@@ -1619,9 +1704,6 @@ class Vs2010Backend(backends.Backend):
         (custom_src, custom_hdrs, custom_objs, _custom_langs) = self.split_sources(custom_target_output_files)
         gen_src += custom_src
         gen_hdrs += custom_hdrs
-
-        compiler = self._get_cl_compiler(target)
-        build_args = Vs2010Backend.get_build_args(compiler, self.optimization, self.debug, self.sanitize)
 
         assert isinstance(target, (build.Executable, build.SharedLibrary, build.StaticLibrary, build.SharedModule)), 'for mypy'
         # Prefix to use to access the build root from the vcxproj dir
@@ -1639,7 +1721,7 @@ class Vs2010Backend(backends.Backend):
             primary_src_lang = get_primary_source_lang(target.sources, custom_src)
             self.add_gen_lite_makefile_vcxproj_elements(root, platform, tfilename[1], vslite_ctx, target, proj_to_build_root, primary_src_lang)
         else:
-            self.add_non_makefile_vcxproj_elements(root, type_config, target, platform, subsystem, build_args, target_args, target_defines, target_inc_dirs, file_args)
+            self.add_non_makefile_vcxproj_elements(root, type_config, target, platform, subsystem, build_args, target_args, target_defines, target_inc_dirs, file_args, uwp)
 
         meson_file_group = ET.SubElement(root, 'ItemGroup')
         ET.SubElement(meson_file_group, 'None', Include=os.path.join(proj_to_src_dir, build_filename))
@@ -1722,6 +1804,8 @@ class Vs2010Backend(backends.Backend):
                         lang = Vs2010Backend.lang_from_source_file(s)
                         self.add_pch(pch_sources, lang, inc_cl)
                         self.add_additional_options(lang, inc_cl, file_args)
+                        if s.endswith("dummy_uwp.cpp"):
+                            ET.SubElement(inc_cl, 'CompileAsWinRT').text = 'true'
                         self.add_preprocessor_defines(lang, inc_cl, file_defines)
                         self.add_include_dirs(lang, inc_cl, file_inc_dirs)
                         ET.SubElement(inc_cl, 'ObjectFileName').text = "$(IntDir)" + \
@@ -1890,12 +1974,13 @@ class Vs2010Backend(backends.Backend):
             ofname = os.path.join(self.environment.get_build_dir(), 'REGEN.vcxproj')
             conftype = 'Utility'
 
+        
         guid = self.environment.coredata.regen_guid
         (root, type_config) = self.create_basic_project(project_name,
                                                         temp_dir='regen-temp',
                                                         guid=guid,
-                                                        conftype=conftype
-                                                        )
+                                                        conftype=conftype,
+                                                        target_uwp=False)
 
         if self.gen_lite:
             (nmake_base_meson_command, exe_search_paths) = Vs2010Backend.get_nmake_base_meson_command_and_exe_search_paths()
@@ -1970,7 +2055,8 @@ class Vs2010Backend(backends.Backend):
         else:
             (root, type_config) = self.create_basic_project(project_name,
                                                             temp_dir='test-temp',
-                                                            guid=guid)
+                                                            guid=guid,
+                                                            target_uwp=False)
 
             action = ET.SubElement(root, 'ItemDefinitionGroup')
             midl = ET.SubElement(action, 'Midl')
@@ -2001,7 +2087,8 @@ class Vs2010Backend(backends.Backend):
             (root, type_config) = self.create_basic_project(project_name,
                                                             temp_dir='install-temp',
                                                             guid=guid,
-                                                            conftype='Makefile'
+                                                            conftype='Makefile',
+                                                            target_uwp=False
                                                             )
             (nmake_base_meson_command, exe_search_paths) = Vs2010Backend.get_nmake_base_meson_command_and_exe_search_paths()
             multi_config_buildtype_list = coredata.get_genvs_default_buildtype_list()
@@ -2022,7 +2109,9 @@ class Vs2010Backend(backends.Backend):
 
             (root, type_config) = self.create_basic_project(project_name,
                                                             temp_dir='install-temp',
-                                                            guid=guid)
+                                                            guid=guid,
+                                                            target_uwp=False
+                                                            )
 
             action = ET.SubElement(root, 'ItemDefinitionGroup')
             midl = ET.SubElement(action, 'Midl')
