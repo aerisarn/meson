@@ -1502,13 +1502,13 @@ class Vs2010Backend(backends.Backend):
 
         if uwp:
             if self.debug:
-                additional_links += ['vccorlibd.lib']
-                additional_links += ['msvcrtd.lib']
-                extra_link_args.append('/nodefaultlib:vccorlibd /nodefaultlib:msvcrtd')
+                #additional_links += ['vccorlibd.lib']
+                #additional_links += ['msvcrtd.lib']
+                extra_link_args.append('/nodefaultlib:vccorlibd /nodefaultlib:msvcrtd vccorlibd.lib msvcrtd.lib')
             else:
-                additional_links += ['vccorlib.lib']
-                additional_links += ['msvcrt.lib']
-                extra_link_args.append('/nodefaultlib:vccorlib /nodefaultlib:msvcrt')
+                #additional_links += ['vccorlib.lib']
+                #additional_links += ['msvcrt.lib']
+                extra_link_args.append('/nodefaultlib:vccorlib /nodefaultlib:msvcrt vccorlib.lib msvcrt.lib')
 
         # Add more libraries to be linked if needed
         for t in target.get_dependencies():
